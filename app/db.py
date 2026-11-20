@@ -29,7 +29,8 @@ CREATE TABLE IF NOT EXISTS observations (
     obs_id         TEXT PRIMARY KEY, -- 观测 ID
     boot_segment   TEXT NOT NULL,    -- 原文：开机段
     counter        INTEGER NOT NULL, -- 原文：段内计数
-    tide_level     REAL NOT NULL,    -- 原文：潮位
+    tide_level     REAL,             -- 原文：潮位（非有限值按 SQLite 规则可能为 NULL）
+    tide_finite    INTEGER NOT NULL, -- 原文潮位是否为有限数（0=NaN/±Inf）
     utc_ms         INTEGER,          -- 换算结果；NULL 表示待校时
     status         TEXT NOT NULL,    -- ok / pending_calibration / conflict
     reason         TEXT,             -- 状态原因
@@ -41,7 +42,58 @@ CREATE TABLE IF NOT EXISTS observations (
 
 CREATE INDEX IF NOT EXISTS idx_observations_utc_ms ON observations(utc_ms);
 CREATE INDEX IF NOT EXISTS idx_observations_segment ON observations(boot_segment);
+
+-- 摘要只保存提交原文；供数结果全部由观测/校时现状即时推导，
+-- 因此不存在会过期的物化状态，重启后结果天然一致。
+CREATE TABLE IF NOT EXISTS summaries (
+    boot_segment TEXT NOT NULL,      -- 开机段
+    start_counter INTEGER NOT NULL,  -- 起始计数（第 0 个应采点）
+    min_tide     REAL NOT NULL,      -- 设备极值：最小潮位（提交时校验为有限数）
+    max_tide     REAL NOT NULL,      -- 设备极值：最大潮位（min <= max）
+    PRIMARY KEY (boot_segment, start_counter)
+);
+
+CREATE INDEX IF NOT EXISTS idx_summaries_segment ON summaries(boot_segment);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对旧版本库做就地迁移（新增列/表均为附加式，不动既有数据）。"""
+    cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(observations)")}
+    if not cols:
+        return
+    if "tide_finite" not in cols:
+        # 旧库中的潮位在写入时即受有限数约束，故历史行一律视为有限；
+        # 旧表 tide_level 为 NOT NULL，而 NaN 需以 NULL 落库 -> 重建为可空列
+        conn.executescript(
+            """
+            ALTER TABLE observations RENAME TO observations_legacy;
+            CREATE TABLE observations (
+                obs_id         TEXT PRIMARY KEY,
+                boot_segment   TEXT NOT NULL,
+                counter        INTEGER NOT NULL,
+                tide_level     REAL,
+                tide_finite    INTEGER NOT NULL,
+                utc_ms         INTEGER,
+                status         TEXT NOT NULL,
+                reason         TEXT,
+                cal_lo_counter INTEGER,
+                cal_lo_utc_ms  INTEGER,
+                cal_hi_counter INTEGER,
+                cal_hi_utc_ms  INTEGER
+            );
+            INSERT INTO observations
+                (obs_id, boot_segment, counter, tide_level, tide_finite, utc_ms,
+                 status, reason, cal_lo_counter, cal_lo_utc_ms,
+                 cal_hi_counter, cal_hi_utc_ms)
+            SELECT obs_id, boot_segment, counter, tide_level, 1, utc_ms,
+                   status, reason, cal_lo_counter, cal_lo_utc_ms,
+                   cal_hi_counter, cal_hi_utc_ms FROM observations_legacy;
+            DROP TABLE observations_legacy;
+            CREATE INDEX IF NOT EXISTS idx_observations_utc_ms ON observations(utc_ms);
+            CREATE INDEX IF NOT EXISTS idx_observations_segment ON observations(boot_segment);
+            """
+        )
 
 
 def get_conn() -> sqlite3.Connection:
@@ -56,6 +108,7 @@ def get_conn() -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.executescript(SCHEMA)
+        _migrate(conn)
         _conn = conn
     return _conn
 
